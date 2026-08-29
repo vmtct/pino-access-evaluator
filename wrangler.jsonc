@@ -6,7 +6,13 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "observability": { "enabled": true },
-  "vars": { "TEAM_DOMAIN": "late-cloud-814f.cloudflareaccess.com" },
+  "vars": {
+    "TEAM_DOMAIN": "late-cloud-814f.cloudflareaccess.com",
+    "CF_ACCOUNT_ID": "952c3c8a236f8e4cbcf6ee10b86ad70c",
+    "TOS_AUD": "9cc2708f62a198982d0597f520529a457e2b055c1835f77119a35286ac8de051",
+    "EVALUATE_URL": "https://pino-access-evaluator.minhtri-van42.workers.dev/evaluate",
+    "KEYS_URL": "https://pino-access-evaluator.minhtri-van42.workers.dev/keys"
+  },
   "kv_namespaces": [
     { "binding": "EVALUATOR_KEYS", "id": "bd1a382f57174072918dccf5b37ac954" }
   ],

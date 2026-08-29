@@ -1,26 +1,18 @@
+import { WorkerEntrypoint } from "cloudflare:workers";
+import { buildStaffPolicyPayload, canonicalTosAllowed, normalizeStaffEmails, type CoreBinding, type IncomingClaims } from "./logic";
 import { createRemoteJWKSet, exportJWK, generateKeyPair, importJWK, jwtVerify, SignJWT } from "jose";
-
-type CoreIdentity = {
-  provider: "cloudflare_access";
-  subject: string;
-  email: string;
-  issuer: string;
-  audience: string[];
-  expiresAt: number;
-};
-
-type CoreResponse = { status: number; body: unknown; requestId: string };
-type CoreBinding = {
-  execute(request: { method: string; path: string; body?: unknown }, identity: CoreIdentity): Promise<CoreResponse>;
-};
 
 type Env = {
   TEAM_DOMAIN: string;
+  CF_ACCOUNT_ID: string;
+  CF_ACCESS_API_TOKEN: string;
+  TOS_AUD: string;
+  EVALUATE_URL: string;
+  KEYS_URL: string;
   EVALUATOR_KEYS: KVNamespace;
   PINO_WORKFORCE_CORE: CoreBinding;
 };
 
-type IncomingClaims = { nonce?: unknown; exp?: unknown; identity?: unknown };
 type StoredKeyset = { kid: string; public: JsonWebKey; private: JsonWebKey };
 const KEYSET_KEY = "external-evaluation-rs256-v1";
 export default {
@@ -52,33 +44,6 @@ async function evaluateRequest(request: Request, env: Env): Promise<Response> {
   } catch {
     return json({ error: "evaluation_failed" }, 403);
   }
-}
-
-export async function canonicalTosAllowed(env: Pick<Env, "PINO_WORKFORCE_CORE" | "TEAM_DOMAIN">, claims: IncomingClaims): Promise<boolean> {
-  const identity = identityFromClaims(claims, env.TEAM_DOMAIN);
-  if (!identity) return false;
-  try {
-    const result = await env.PINO_WORKFORCE_CORE.execute({ method: "GET", path: "/context" }, identity);
-    return result.status === 200;
-  } catch {
-    return false;
-  }
-}
-
-export function identityFromClaims(claims: IncomingClaims, teamDomain: string): CoreIdentity | null {
-  if (!claims.identity || typeof claims.identity !== "object" || Array.isArray(claims.identity)) return null;
-  const row = claims.identity as Record<string, unknown>;
-  const email = typeof row.email === "string" ? row.email.trim().toLowerCase() : "";
-  const subject = typeof row.user_uuid === "string" ? row.user_uuid.trim() : "";
-  if (!email || !subject || typeof claims.exp !== "number") return null;
-  return {
-    provider: "cloudflare_access",
-    subject,
-    email,
-    issuer: `https://${teamDomain}`,
-    audience: [],
-    expiresAt: claims.exp,
-  };
 }
 
 async function verifyAccessToken(token: string, teamDomain: string): Promise<IncomingClaims> {
@@ -120,4 +85,48 @@ function json(body: unknown, status = 200, headers: HeadersInit = {}) {
       ...headers,
     },
   });
+}
+
+
+export class AccessSyncControlPlane extends WorkerEntrypoint<Env> {
+  async reconcile(input: { emails: string[] }) {
+    return reconcileTosStaffPolicy(this.env, input.emails);
+  }
+}
+
+async function reconcileTosStaffPolicy(env: Env, rawEmails: string[]) {
+  const emails = normalizeStaffEmails(rawEmails);
+  if (!env.CF_ACCOUNT_ID || !env.CF_ACCESS_API_TOKEN || !env.TOS_AUD) throw new Error("access sync configuration missing");
+  const api = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}`;
+  const apps = await cfJson(env, `${api}/access/apps?per_page=100`);
+  const matches = apps.result.filter((app: any) => app?.aud === env.TOS_AUD);
+  if (matches.length !== 1) throw new Error("TOS Access application must resolve uniquely");
+  const appId = matches[0].id as string;
+  const policies = await cfJson(env, `${api}/access/apps/${appId}/policies?per_page=100`);
+  const named = policies.result.filter((policy: any) => policy?.name === "PINO Staff Canonical External Evaluation" && policy?.decision === "allow");
+  if (named.length > 1) throw new Error("TOS staff policy is ambiguous");
+  const existing = named[0] as any | undefined;
+  if (emails.length === 0) {
+    if (existing?.id) await cfJson(env, `${api}/access/apps/${appId}/policies/${existing.id}`, { method: "DELETE" });
+    return { state: existing ? "deleted" : "absent", emailCount: 0, policyId: null };
+  }
+  const payload = buildStaffPolicyPayload(emails, env, typeof existing?.precedence === "number" ? existing.precedence : 50);
+  const targetUrl = existing?.id ? `${api}/access/apps/${appId}/policies/${existing.id}` : `${api}/access/apps/${appId}/policies`;
+  const updated = await cfJson(env, targetUrl, { method: existing?.id ? "PUT" : "POST", body: JSON.stringify(payload) });
+  const policyId = updated.result?.id as string | undefined;
+  if (!policyId) throw new Error("Cloudflare did not return the TOS staff policy id");
+  const verify = await cfJson(env, `${api}/access/apps/${appId}/policies?per_page=100`);
+  const policy = verify.result.find((item: any) => item?.id === policyId);
+  const actualEmails = Array.isArray(policy?.include) ? policy.include.map((item: any) => item?.email?.email).filter(Boolean).sort() : [];
+  const hasEveryone = verify.result.some((item: any) => item?.decision === "allow" && Array.isArray(item?.include) && item.include.some((rule: any) => rule?.everyone));
+  const hasEvaluator = Array.isArray(policy?.require) && policy.require.some((rule: any) => rule?.external_evaluation?.evaluate_url === env.EVALUATE_URL && rule?.external_evaluation?.keys_url === env.KEYS_URL);
+  if (hasEveryone || !hasEvaluator || JSON.stringify(actualEmails) !== JSON.stringify(emails)) throw new Error("TOS staff policy verification failed");
+  return { state: existing ? "updated" : "created", emailCount: emails.length, policyId };
+}
+
+async function cfJson(env: Pick<Env, "CF_ACCESS_API_TOKEN">, url: string, init: RequestInit = {}): Promise<any> {
+  const response = await fetch(url, { ...init, headers: { authorization: `Bearer ${env.CF_ACCESS_API_TOKEN}`, "content-type": "application/json", ...(init.headers ?? {}) } });
+  const body = await response.json() as any;
+  if (!response.ok || body?.success !== true || !Array.isArray(body?.errors) || body.errors.length > 0) throw new Error(`Cloudflare Access API failed (${response.status})`);
+  return body;
 }
