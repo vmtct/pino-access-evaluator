@@ -1,5 +1,4 @@
-import { createRemoteJWKSet, importJWK, jwtVerify, SignJWT } from "jose";
-import { publicJwk } from "./public-jwk";
+import { createRemoteJWKSet, exportJWK, generateKeyPair, importJWK, jwtVerify, SignJWT } from "jose";
 
 type CoreIdentity = {
   provider: "cloudflare_access";
@@ -11,26 +10,25 @@ type CoreIdentity = {
 };
 
 type CoreResponse = { status: number; body: unknown; requestId: string };
-type CoreBinding = { execute(request: { method: string; path: string; body?: unknown }, identity: CoreIdentity): Promise<CoreResponse> };
+type CoreBinding = {
+  execute(request: { method: string; path: string; body?: unknown }, identity: CoreIdentity): Promise<CoreResponse>;
+};
 
 type Env = {
   TEAM_DOMAIN: string;
-  EVALUATOR_PRIVATE_JWK: string;
+  EVALUATOR_KEYS: KVNamespace;
   PINO_WORKFORCE_CORE: CoreBinding;
 };
 
-type IncomingClaims = {
-  nonce?: unknown;
-  exp?: unknown;
-  identity?: unknown;
-};
-let keyPromise: Promise<CryptoKey | Uint8Array> | null = null;
-
+type IncomingClaims = { nonce?: unknown; exp?: unknown; identity?: unknown };
+type StoredKeyset = { kid: string; public: JsonWebKey; private: JsonWebKey };
+const KEYSET_KEY = "external-evaluation-rs256-v1";
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && (url.pathname === "/keys" || url.pathname === "/keys/")) {
-      return json({ keys: [publicJwk] }, 200, { "cache-control": "public, max-age=300" });
+      const keyset = await ensureKeyset(env.EVALUATOR_KEYS);
+      return json({ keys: [{ ...keyset.public, kid: keyset.kid, alg: "RS256", use: "sig" }] }, 200, { "cache-control": "public, max-age=300" });
     }
     if (request.method === "GET" && url.pathname === "/health") return json({ ok: true });
     if (request.method !== "POST" || !["/", "/evaluate", "/evaluate/"].includes(url.pathname)) {
@@ -49,7 +47,7 @@ async function evaluateRequest(request: Request, env: Env): Promise<Response> {
     const nonce = typeof claims.nonce === "string" ? claims.nonce : "";
     if (!nonce) return json({ error: "invalid_nonce" }, 403);
     const allowed = await canonicalTosAllowed(env, claims);
-    const token = await signDecision(env, { success: allowed, nonce, iat: now, exp: now + 60 });
+    const token = await signDecision(env.EVALUATOR_KEYS, { success: allowed, nonce, iat: now, exp: now + 60 });
     return json({ token });
   } catch {
     return json({ error: "evaluation_failed" }, 403);
@@ -90,17 +88,36 @@ async function verifyAccessToken(token: string, teamDomain: string): Promise<Inc
   return payload as IncomingClaims;
 }
 
-async function signDecision(env: Pick<Env, "EVALUATOR_PRIVATE_JWK">, payload: { success: boolean; nonce: string; iat: number; exp: number }) {
-  if (!keyPromise) {
-    const jwk = JSON.parse(env.EVALUATOR_PRIVATE_JWK) as JsonWebKey;
-    keyPromise = importJWK(jwk, "RS256");
-  }
-  const key = await keyPromise;
+async function ensureKeyset(kv: KVNamespace): Promise<StoredKeyset> {
+  const stored = await kv.get<StoredKeyset>(KEYSET_KEY, "json");
+  if (stored?.kid && stored.public && stored.private) return stored;
+  const { publicKey, privateKey } = await generateKeyPair("RS256", { extractable: true });
+  const kid = crypto.randomUUID();
+  const keyset: StoredKeyset = {
+    kid,
+    public: await exportJWK(publicKey),
+    private: await exportJWK(privateKey),
+  };
+  await kv.put(KEYSET_KEY, JSON.stringify(keyset));
+  return keyset;
+}
+async function signDecision(kv: KVNamespace, payload: { success: boolean; nonce: string; iat: number; exp: number }) {
+  const keyset = await ensureKeyset(kv);
+  const key = await importJWK(keyset.private, "RS256");
   return new SignJWT({ success: payload.success, nonce: payload.nonce })
-    .setProtectedHeader({ alg: "RS256", kid: publicJwk.kid })
-    .setIssuedAt(payload.iat).setExpirationTime(payload.exp).sign(key);
+    .setProtectedHeader({ alg: "RS256", kid: keyset.kid })
+    .setIssuedAt(payload.iat)
+    .setExpirationTime(payload.exp)
+    .sign(key);
 }
 
 function json(body: unknown, status = 200, headers: HeadersInit = {}) {
-  return Response.json(body, { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers } });
+  return Response.json(body, {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      ...headers,
+    },
+  });
 }

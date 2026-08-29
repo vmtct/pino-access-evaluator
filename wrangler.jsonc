@@ -6,9 +6,10 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "observability": { "enabled": true },
-  "vars": {
-    "TEAM_DOMAIN": "late-cloud-814f.cloudflareaccess.com"
-  },
+  "vars": { "TEAM_DOMAIN": "late-cloud-814f.cloudflareaccess.com" },
+  "kv_namespaces": [
+    { "binding": "EVALUATOR_KEYS", "id": "bd1a382f57174072918dccf5b37ac954" }
+  ],
   "services": [
     {
       "binding": "PINO_WORKFORCE_CORE",
