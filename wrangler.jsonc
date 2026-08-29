@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pino-access-evaluator",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-29",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "vars": {
+    "TEAM_DOMAIN": "late-cloud-814f.cloudflareaccess.com"
+  },
+  "services": [
+    {
+      "binding": "PINO_WORKFORCE_CORE",
+      "service": "pino-core",
+      "entrypoint": "WorkforceControlPlane"
+    }
+  ]
+}
