@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonicalTosAllowed, identityFromClaims } from "./index";
+import { buildStaffPolicyPayload, canonicalTosAllowed, identityFromClaims, normalizeStaffEmails } from "./logic";
 
 const claims = {
   exp: Math.floor(Date.now() / 1000) + 300,
@@ -42,4 +42,21 @@ test("denies Core 403, unknown users, and binding failures", async () => {
   }, claims);
   assert.equal(denied, false);
   assert.equal(failed, false);
+});
+
+
+test("normalizes a unique explicit staff email allowlist", () => {
+  assert.deepEqual(normalizeStaffEmails([" A@Example.com ", "b@example.com"]), ["a@example.com", "b@example.com"]);
+  assert.throws(() => normalizeStaffEmails(["a@example.com", "A@example.com"]), /unique valid/);
+  assert.throws(() => normalizeStaffEmails(["not-an-email"]), /unique valid/);
+});
+
+test("builds Include email plus Require external evaluation", () => {
+  const payload = buildStaffPolicyPayload(["staff@example.com"], {
+    EVALUATE_URL: "https://evaluator.example/evaluate",
+    KEYS_URL: "https://evaluator.example/keys",
+  });
+  assert.deepEqual(payload.include, [{ email: { email: "staff@example.com" } }]);
+  assert.deepEqual(payload.require, [{ external_evaluation: { evaluate_url: "https://evaluator.example/evaluate", keys_url: "https://evaluator.example/keys" } }]);
+  assert.equal(payload.decision, "allow");
 });
